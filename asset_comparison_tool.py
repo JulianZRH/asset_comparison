@@ -78,6 +78,17 @@ def ask_currency():
     return raw if raw else "CHF"
 
 
+def ask_start_date():
+    while True:
+        raw = input("Start date YYYY-MM-DD [0 = full common history]: ").strip()
+        if raw in ("", "0"):
+            return None
+        try:
+            return pd.Timestamp(raw).normalize()
+        except Exception:
+            print("Invalid date, please use YYYY-MM-DD (or 0 / Enter for full history).\n")
+
+
 def isin_from_onvista(long_name, short_name):
     """Look up the ISIN by fund/company name via onvista's public search.
 
@@ -273,6 +284,7 @@ def main():
     while True:
         tickers = ask_tickers()
         target = ask_currency()
+        start = ask_start_date()
         print()
         data, meta = download(tickers, target)
         found = list(data)
@@ -283,6 +295,12 @@ def main():
         if df.empty:
             print("\nNo overlapping date range between these assets. Please try again.\n")
             continue
+        if start is not None:
+            df = df.loc[df.index >= start]
+            if len(df) < 2:
+                print(f"\nNo overlapping data on or after {start.date()}. Please try again.\n")
+                continue
+        print(f"Comparison period: {df.index[0].date()} to {df.index[-1].date()}")
         plot(df, found, target, meta)
         again = input("\nCompare more assets? [y/N]: ").strip().lower()
         if again not in ("y", "yes", "j", "ja"):
