@@ -4,8 +4,9 @@ Define a Basket and a Benchmark portfolio of Yahoo Finance tickers or ISINs
 with weights, choose a base currency and an optional start date. The tool
 downloads max history (dividend-adjusted), converts everything to the base
 currency and plots the normalized total-return comparison of the two
-portfolios plus their yearly return difference. The chart is shown in a
-window and also saved as asset_comparison.png.
+portfolios, their 30-day rolling realized volatility, their drawdown
+(with max drawdown) and their yearly return difference. The chart is
+shown in a window and also saved as asset_comparison.png.
 """
 
 import difflib
@@ -158,17 +159,18 @@ def get_meta(tk_, ticker, known_isin=None):
         pass
     name = long_name or short_name
     isin = known_isin
+    if isin is None and name:
+        # onvista first: yfinance's Ticker.isin scrapes businessinsider.com,
+        # which often stalls for ~30s per ticker before timing out
+        try:
+            isin = isin_from_onvista(name, short_name or "")
+        except Exception:
+            pass
     if isin is None:
         try:
             isin = tk_.isin
             if isin in (None, "", "-"):
                 isin = None
-        except Exception:
-            pass
-    if isin is None and name:
-        # yfinance's ISIN lookup often fails for non-US listings
-        try:
-            isin = isin_from_onvista(name, short_name or "")
         except Exception:
             pass
     return {"name": name or ticker, "isin": isin}
@@ -258,6 +260,10 @@ def make_figure(df, weights, metas, target):
     years = (df.index[-1] - df.index[0]).days / 365.25
     cagrs = {c: (df[c].iloc[-1] / df[c].iloc[0]) ** (1 / years) - 1 for c in cols}
 
+    # 30-trading-day realized volatility, annualized
+    vol = df.pct_change().rolling(30).std() * (252 ** 0.5) * 100
+    drawdown = (df / df.cummax() - 1) * 100
+
     yearly_diff = None
     if len(cols) == 2:
         yearly = df.resample("YE").last().pct_change().dropna()
@@ -266,21 +272,43 @@ def make_figure(df, weights, metas, target):
             yearly_diff = yearly[cols[0]] - yearly[cols[1]]
 
     two = yearly_diff is not None
-    fig = Figure(figsize=(12.5, 8.5) if two else (12.5, 6), dpi=100)
-    if two:
-        ax1, ax2 = fig.subplots(2, 1, gridspec_kw={"height_ratios": [2, 1]})
-    else:
-        ax1 = fig.subplots()
+    ratios = [2.4, 1, 1] + ([1] if two else [])
+    fig = Figure(figsize=(12.5, 12.5) if two else (12.5, 10), dpi=100)
+    gs = fig.add_gridspec(len(ratios), 1, height_ratios=ratios)
+    ax1 = fig.add_subplot(gs[0])
+    ax_vol = fig.add_subplot(gs[1], sharex=ax1)
+    ax_dd = fig.add_subplot(gs[2], sharex=ax1)
+    ax2 = fig.add_subplot(gs[3]) if two else None
 
+    colors = {}
     for c in cols:
-        ax1.plot(df.index, df[c],
-                 label=portfolio_label(c, weights[c], metas, cagrs[c]), linewidth=1.5)
+        line, = ax1.plot(df.index, df[c],
+                         label=portfolio_label(c, weights[c], metas, cagrs[c]),
+                         linewidth=1.5)
+        colors[c] = line.get_color()
     ax1.set_title(f"{' vs '.join(cols)} — Total Return Comparison ({target}, normalized to 100)",
                   fontsize=13)
     ax1.set_ylabel(f"Growth of {target} 100")
     ax1.legend(fontsize=9)
     ax1.grid(True, alpha=0.3)
     ax1.yaxis.set_major_formatter(mticker.FormatStrFormatter(f"{target} %.0f"))
+
+    for c in cols:
+        ax_vol.plot(vol.index, vol[c], label=c, color=colors[c], linewidth=1.0)
+    ax_vol.set_title("30-Day Rolling Realized Volatility (annualized)", fontsize=13)
+    ax_vol.set_ylabel("Volatility (%)")
+    ax_vol.legend(fontsize=9)
+    ax_vol.grid(True, alpha=0.3)
+
+    for c in cols:
+        ax_dd.plot(drawdown.index, drawdown[c],
+                   label=f"{c} (max drawdown: {drawdown[c].min():.1f}%)",
+                   color=colors[c], linewidth=1.0)
+        ax_dd.fill_between(drawdown.index, drawdown[c], 0, color=colors[c], alpha=0.15)
+    ax_dd.set_title("Drawdown", fontsize=13)
+    ax_dd.set_ylabel("Drawdown (%)")
+    ax_dd.legend(fontsize=9, loc="lower left")
+    ax_dd.grid(True, alpha=0.3)
 
     if two:
         colors = ["green" if v >= 0 else "red" for v in yearly_diff.values]
