@@ -7,6 +7,10 @@ currency and plots the normalized total-return comparison of the two
 portfolios, their 30-day rolling realized volatility, their drawdown
 (with max drawdown) and their yearly return difference. The chart is
 shown in a window and also saved as asset_comparison.png.
+
+ISINs that Yahoo Finance doesn't list (e.g. Swiss pension-plan funds) are
+loaded from Morningstar. If such a fund is only priced monthly, all assets
+are compared on month-end values.
 """
 
 import difflib
@@ -179,9 +183,67 @@ def get_meta(tk_, ticker, known_isin=None):
 def asset_label(t, meta):
     m = meta.get(t, {})
     parts = [t]
-    if m.get("isin"):
+    if m.get("isin") and m["isin"] != t:
         parts.append(m["isin"])
     return f"{m.get('name', t)} ({', '.join(parts)})"
+
+
+# public API behind Morningstar's fund widgets; the path segment is the
+# widget's access token, not a personal key
+MS_API = "https://lt.morningstar.com/api/rest.svc"
+MS_TOKEN = "klr5zyak8x"
+
+
+def morningstar_lookup(isin):
+    """Find a security on Morningstar by ISIN; returns its screener row or None."""
+    r = requests.get(
+        f"{MS_API}/{MS_TOKEN}/security/screener",
+        params={"page": 1, "pageSize": 10, "outputType": "json", "version": 1,
+                "languageId": "en-GB", "term": isin,
+                "securityDataPoints": "SecId|Name|isin|PriceCurrency|Universe"},
+        headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+    )
+    r.raise_for_status()
+    rows = [row for row in r.json().get("rows", []) if row.get("isin") == isin]
+    return rows[0] if rows else None
+
+
+def morningstar_series(kind, sec, **params):
+    r = requests.get(
+        f"{MS_API}/{kind}/{MS_TOKEN}",
+        params={"id": f"{sec['SecId']}]2]0]{sec['Universe']}",
+                "currencyId": sec["PriceCurrency"], "idtype": "Morningstar",
+                "frequency": "daily", "startDate": "1900-01-01",
+                "outputType": "COMPACTJSON", **params},
+        headers={"User-Agent": "Mozilla/5.0"}, timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return pd.Series([v for _, v in data], dtype=float,
+                     index=pd.to_datetime([ts for ts, _ in data], unit="ms"))
+
+
+def load_morningstar(isin, sec, target, log):
+    nav = morningstar_series("timeseries_price", sec, priceType="")
+    if nav.empty:
+        raise ValueError(f"No price data for {isin} on Morningstar")
+    cumret = morningstar_series("timeseries_cumulativereturn", sec)
+    if cumret.empty:
+        log(f"  WARNING: {isin}: no total-return data, using NAV (distributions not included)")
+        close = nav
+    else:
+        # the cumulative total return is a calendar-daily, forward-filled
+        # series; keep only the days the fund actually published a NAV
+        close = (1 + cumret / 100).reindex(nav.index, method="ffill").dropna()
+    currency = sec["PriceCurrency"]
+    fx = fx_to_target(currency, target)
+    if fx is not None:
+        close = (close * fx.reindex(close.index, method="ffill")).dropna()
+    meta = {"name": sec["Name"], "isin": isin}
+    log(f"  {isin}: {meta['name']} (Morningstar)")
+    log(f"  {isin}: {close.index[0].date()} to {close.index[-1].date()} "
+        f"({len(close)} prices, {currency}->{target})")
+    return close, meta
 
 
 def load_asset(ticker, target, known_isin, log):
@@ -201,28 +263,49 @@ def load_asset(ticker, target, known_isin, log):
     return close, meta
 
 
+def load_entry(entry, target, log):
+    """Download a ticker or ISIN; returns (key, close, meta)."""
+    if not ISIN_RE.match(entry):
+        log(f"Downloading {entry} ...")
+        return (entry, *load_asset(entry, target, None, log))
+    try:
+        t = resolve_isin(entry, log)
+    except ValueError:
+        sec = morningstar_lookup(entry)
+        if sec is None:
+            raise ValueError(f"Neither Yahoo Finance nor Morningstar know ISIN {entry}")
+        log(f"Downloading {entry} from Morningstar (not on Yahoo Finance) ...")
+        return (entry, *load_morningstar(entry, sec, target, log))
+    log(f"  ISIN {entry} -> ticker {t}")
+    log(f"Downloading {t} ...")
+    return (t, *load_asset(t, target, entry, log))
+
+
 def build_result(portfolios, target, start, log):
     """portfolios: {name: [(ticker_or_isin, weight_percent), ...]}
 
     Returns (df, weights, metas) where df holds one total-return series per
     portfolio, normalized to 100 at the start of the common date range.
     """
-    prices, metas, weights = {}, {}, {}
+    prices, metas, weights, keys = {}, {}, {}, {}
     for pname, rows in portfolios.items():
         w = {}
         for entry, weight in rows:
-            known_isin = None
-            t = entry
-            if ISIN_RE.match(entry):
-                known_isin = entry
-                t = resolve_isin(entry, log)
-                log(f"  ISIN {entry} -> ticker {t}")
-            if t not in prices:
-                log(f"Downloading {t} ...")
-                prices[t], metas[t] = load_asset(t, target, known_isin, log)
+            if entry not in keys:
+                t, close, meta = load_entry(entry, target, log)
+                keys[entry] = t
+                prices[t], metas[t] = close, meta
+            t = keys[entry]
             w[t] = w.get(t, 0.0) + weight
         weights[pname] = w
 
+    # a fund priced only monthly shares almost no days with daily-priced
+    # assets, so then compare all assets on month-end values
+    monthly = [t for t, s in prices.items()
+               if s.index.to_series().diff().median() > pd.Timedelta(days=3)]
+    if monthly:
+        log(f"  {', '.join(monthly)}: priced only monthly, comparing month-end values")
+        prices = {t: s.resample("ME").last() for t, s in prices.items()}
     df = pd.DataFrame(prices).dropna()
     if df.empty:
         raise ValueError("No overlapping date range between all assets.")
@@ -260,8 +343,11 @@ def make_figure(df, weights, metas, target):
     years = (df.index[-1] - df.index[0]).days / 365.25
     cagrs = {c: (df[c].iloc[-1] / df[c].iloc[0]) ** (1 / years) - 1 for c in cols}
 
-    # 30-trading-day realized volatility, annualized
-    vol = df.pct_change().rolling(30).std() * (252 ** 0.5) * 100
+    # realized volatility, annualized: over 30 trading days, or over 12
+    # months when a monthly-priced fund forced month-end data
+    monthly = len(df) / years < 100
+    window, periods, vol_span = (12, 12, "12-Month") if monthly else (30, 252, "30-Day")
+    vol = df.pct_change().rolling(window).std() * (periods ** 0.5) * 100
     drawdown = (df / df.cummax() - 1) * 100
 
     yearly_diff = None
@@ -286,8 +372,8 @@ def make_figure(df, weights, metas, target):
                          label=portfolio_label(c, weights[c], metas, cagrs[c]),
                          linewidth=1.5)
         colors[c] = line.get_color()
-    ax1.set_title(f"{' vs '.join(cols)} — Total Return Comparison ({target}, normalized to 100)",
-                  fontsize=13)
+    ax1.set_title(f"{' vs '.join(cols)} — Total Return Comparison ({target}, normalized to 100"
+                  f"{', month-end values' if monthly else ''})", fontsize=13)
     ax1.set_ylabel(f"Growth of {target} 100")
     ax1.legend(fontsize=9)
     ax1.grid(True, alpha=0.3)
@@ -295,7 +381,7 @@ def make_figure(df, weights, metas, target):
 
     for c in cols:
         ax_vol.plot(vol.index, vol[c], label=c, color=colors[c], linewidth=1.0)
-    ax_vol.set_title("30-Day Rolling Realized Volatility (annualized)", fontsize=13)
+    ax_vol.set_title(f"{vol_span} Rolling Realized Volatility (annualized)", fontsize=13)
     ax_vol.set_ylabel("Volatility (%)")
     ax_vol.legend(fontsize=9)
     ax_vol.grid(True, alpha=0.3)
@@ -386,7 +472,7 @@ class PortfolioTable(ttk.LabelFrame):
 class App:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Asset Comparison Tool (Yahoo Finance)")
+        self.root.title("Asset Comparison Tool (Yahoo Finance, Morningstar)")
 
         top = ttk.Frame(self.root)
         top.pack(fill="x", padx=10, pady=(10, 4))

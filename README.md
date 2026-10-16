@@ -37,3 +37,14 @@ python asset_comparison_tool.py
 Prices are dividend-adjusted (`auto_adjust=True`), so the comparison reflects
 total return, not just price return. Data quality is limited by what Yahoo
 Finance provides.
+
+## Funds not on Yahoo Finance
+
+ISINs that Yahoo Finance doesn't list (e.g. Swiss pension-plan funds such as
+`CH0032831981`, Avadis Vermögensbildung SICAV – Strategie Aktien) are loaded
+from Morningstar's public fund API instead, as a total-return series with
+distributions reinvested.
+
+Some of these funds publish a price only once a month. If any asset is priced
+monthly, all assets are compared on month-end values and the volatility panel
+uses a 12-month rolling window instead of 30 days.
